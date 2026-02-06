@@ -1,0 +1,30 @@
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfvars
+terraform/.terraform.lock.hcl
+
+# Environment files
+.env
+*.env
+
+# SSH keys
+*.pem
+*.key
+ssh_key*
+
+# CI/CD artifacts
+server_ip.txt
+directus_homepage.html
+deployment_report.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
