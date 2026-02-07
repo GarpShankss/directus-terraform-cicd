@@ -1,0 +1,347 @@
+stages:
+  - validate
+  - plan
+  - provision
+  - deploy
+  - test
+  - cleanup
+
+variables:
+  TF_ROOT: ${CI_PROJECT_DIR}/terraform
+  TF_STATE_NAME: default
+
+# Cache Terraform plugins
+cache:
+  key: "${CI_COMMIT_REF_SLUG}"
+  paths:
+    - ${TF_ROOT}/.terraform
+
+# ============================================
+# STAGE: VALIDATE
+# ============================================
+
+terraform_validate:
+  stage: validate
+  image: hashicorp/terraform:latest
+  script:
+    - cd ${TF_ROOT}
+    - terraform init -backend=false
+    - terraform validate
+    - terraform fmt -check -recursive
+    - echo "✅ Terraform validation successful" | tee validation_report.txt
+  artifacts:
+    paths:
+      - ${TF_ROOT}/validation_report.txt
+    expire_in: 1 week
+  only:
+    - branches
+
+terraform_lint:
+  stage: validate
+  image: ghcr.io/terraform-linters/tflint:latest
+  before_script:
+    - cd ${TF_ROOT}
+  script:
+    - tflint --init
+    - tflint --format compact | tee lint_report.txt
+    - echo "✅ Terraform linting completed" | tee -a lint_report.txt
+  artifacts:
+    paths:
+      - ${TF_ROOT}/lint_report.txt
+    expire_in: 1 week
+  allow_failure: true
+  only:
+    - branches
+
+docker_validate:
+  stage: validate
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker compose -f docker-compose.yml config > docker_config_report.txt
+    - echo "✅ Docker Compose validation successful" | tee -a docker_config_report.txt
+  artifacts:
+    paths:
+      - docker_config_report.txt
+    expire_in: 1 week
+  only:
+    - branches
+
+# ============================================
+# STAGE: PLAN
+# ============================================
+
+terraform_plan:
+  stage: plan
+  image: hashicorp/terraform:latest
+  script:
+    - cd ${TF_ROOT}
+    - terraform init
+    - terraform plan -out=tfplan
+    - echo "✅ Terraform plan created successfully"
+  artifacts:
+    paths:
+      - ${TF_ROOT}/tfplan
+      - ${TF_ROOT}/.terraform
+    expire_in: 1 week
+  only:
+    - branches
+
+# ============================================
+# STAGE: PROVISION
+# ============================================
+
+terraform_apply:
+  stage: provision
+  image: hashicorp/terraform:latest
+  script:
+    - cd ${TF_ROOT}
+    - terraform init
+    - terraform apply -auto-approve
+    - echo "✅ Infrastructure provisioned successfully"
+
+    # Extract outputs
+    - terraform output -raw instance_public_ip > ${CI_PROJECT_DIR}/server_ip.txt
+    - terraform output -raw ssh_private_key > ${CI_PROJECT_DIR}/ssh_key.pem
+    - chmod 600 ${CI_PROJECT_DIR}/ssh_key.pem
+
+    # Display connection info
+    - echo "Server IP:" $(cat ${CI_PROJECT_DIR}/server_ip.txt)
+    - echo "Directus URL:" $(terraform output -raw directus_url)
+
+  artifacts:
+    paths:
+      - ${CI_PROJECT_DIR}/server_ip.txt
+      - ${CI_PROJECT_DIR}/ssh_key.pem
+      - ${TF_ROOT}/.terraform
+      - ${TF_ROOT}/terraform.tfstate
+    expire_in: 1 day
+  when: manual
+  only:
+    - branches
+
+# ============================================
+# STAGE: DEPLOY
+# ============================================
+
+deploy_directus:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client bash curl
+    - chmod 600 ${CI_PROJECT_DIR}/ssh_key.pem
+    - export SERVER_IP=$(cat ${CI_PROJECT_DIR}/server_ip.txt)
+    - echo "Deploying to server ${SERVER_IP}"
+  script:
+    # Wait for server to be ready
+    - echo "Waiting for server to be ready..."
+    - sleep 90
+
+    # Test SSH connection
+    - |
+      for i in {1..10}; do
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+          -i ${CI_PROJECT_DIR}/ssh_key.pem ubuntu@${SERVER_IP} "echo 'SSH connection successful'" && break
+        echo "Attempt $i failed, retrying..."
+        sleep 10
+      done
+
+    # Copy docker-compose.yml to server
+    - |
+      scp -o StrictHostKeyChecking=no -i ${CI_PROJECT_DIR}/ssh_key.pem \
+        ${CI_PROJECT_DIR}/docker-compose.yml \
+        ubuntu@${SERVER_IP}:/home/ubuntu/directus/
+
+    # Generate .env file on server
+    - |
+      ssh -o StrictHostKeyChecking=no -i ${CI_PROJECT_DIR}/ssh_key.pem ubuntu@${SERVER_IP} bash <<'ENDSSH'
+        cd /home/ubuntu/directus
+        
+        cat > .env <<EOF
+      ADMIN_EMAIL=${ADMIN_EMAIL}
+      ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      DB_PASSWORD=${DB_PASSWORD}
+      DIRECTUS_SECRET=${DIRECTUS_SECRET}
+      EOF
+        
+        echo "✅ Environment file created"
+        ls -la
+      ENDSSH
+
+    # Deploy Directus using Docker Compose
+    - |
+      ssh -o StrictHostKeyChecking=no -i ${CI_PROJECT_DIR}/ssh_key.pem ubuntu@${SERVER_IP} bash <<'ENDSSH'
+        cd /home/ubuntu/directus
+        
+        # Pull images
+        docker compose pull
+        
+        # Start services
+        docker compose up -d
+        
+        echo "✅ Docker Compose services started"
+        docker compose ps
+      ENDSSH
+
+    # Wait for Directus to be healthy
+    - echo "Waiting for Directus to become healthy..."
+    - sleep 60
+    - |
+      for i in {1..20}; do
+        if curl -f -s http://${SERVER_IP}:8055/server/health > /dev/null; then
+          echo "✅ Directus is healthy!"
+          break
+        fi
+        echo "Attempt $i: Directus not ready yet..."
+        sleep 15
+      done
+
+    - echo "🎉 Deployment completed successfully!"
+    - echo "Directus URL: http://${SERVER_IP}:8055"
+  dependencies:
+    - terraform_apply
+  artifacts:
+    paths:
+      - ${CI_PROJECT_DIR}/server_ip.txt
+    expire_in: 1 day
+  only:
+    - branches
+
+# ============================================
+# STAGE: TEST
+# ============================================
+
+health_check:
+  stage: test
+  image: curlimages/curl:latest
+  script:
+    - export SERVER_IP=$(cat ${CI_PROJECT_DIR}/server_ip.txt)
+    - echo "Running health check on http://${SERVER_IP}:8055"
+
+    # Test Directus health endpoint
+    - |
+      if curl -f -s http://${SERVER_IP}:8055/server/health; then
+        echo "✅ Health check passed" | tee health_check_result.txt
+      else
+        echo "❌ Health check failed" | tee health_check_result.txt
+        exit 1
+      fi
+
+    # Test main page accessibility
+    - |
+      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://${SERVER_IP}:8055)
+      echo "HTTP Status Code: ${HTTP_CODE}" | tee -a health_check_result.txt
+      if [ "${HTTP_CODE}" -eq 200 ]; then
+        echo "✅ Directus site is accessible" | tee -a health_check_result.txt
+      else
+        echo "⚠️  Received HTTP ${HTTP_CODE}" | tee -a health_check_result.txt
+      fi
+  dependencies:
+    - deploy_directus
+  artifacts:
+    paths:
+      - health_check_result.txt
+    expire_in: 1 week
+  only:
+    - branches
+
+capture_homepage:
+  stage: test
+  image: curlimages/curl:latest
+  script:
+    - export SERVER_IP=$(cat ${CI_PROJECT_DIR}/server_ip.txt)
+    - echo "Capturing Directus homepage from http://${SERVER_IP}:8055"
+    - curl -L -o directus_homepage.html http://${SERVER_IP}:8055
+    - echo "✅ Homepage captured successfully"
+    - ls -lh directus_homepage.html
+  dependencies:
+    - deploy_directus
+  artifacts:
+    paths:
+      - directus_homepage.html
+    expire_in: 1 week
+  only:
+    - branches
+
+generate_report:
+  stage: test
+  image: alpine:latest
+  script:
+    - export SERVER_IP=$(cat ${CI_PROJECT_DIR}/server_ip.txt)
+    - |
+      cat > deployment_report.md <<EOF
+      # Directus Deployment Report
+
+      **Pipeline ID:** ${CI_PIPELINE_ID}
+      **Commit SHA:** ${CI_COMMIT_SHA}
+      **Branch:** ${CI_COMMIT_REF_NAME}
+      **Triggered by:** ${GITLAB_USER_NAME}
+      **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+      ---
+
+      ## Deployment Information
+
+      - **Server IP:** ${SERVER_IP}
+      - **Directus URL:** http://${SERVER_IP}:8055
+      - **Admin Email:** ${ADMIN_EMAIL}
+
+      ---
+
+      ## Pipeline Stages Status
+
+      - ✅ Validate: Completed
+      - ✅ Plan: Completed
+      - ✅ Provision: Completed
+      - ✅ Deploy: Completed
+      - ✅ Test: Completed
+
+      ---
+
+      ## Test Results
+
+      $(cat health_check_result.txt)
+
+      ---
+
+      ## Access Instructions
+
+      1. Navigate to: http://${SERVER_IP}:8055
+      2. Login with admin credentials configured in CI/CD variables
+      3. Start managing your content!
+
+      ---
+
+      **Report generated by GitLab CI/CD Pipeline**
+      EOF
+
+    - cat deployment_report.md
+    - echo "✅ Deployment report generated"
+  dependencies:
+    - deploy_directus
+    - health_check
+  artifacts:
+    paths:
+      - deployment_report.md
+    expire_in: 1 week
+  only:
+    - branches
+
+# ============================================
+# STAGE: CLEANUP
+# ============================================
+
+terraform_destroy:
+  stage: cleanup
+  image: hashicorp/terraform:latest
+  script:
+    - cd ${TF_ROOT}
+    - terraform init
+    - terraform destroy -auto-approve
+    - echo "✅ Infrastructure destroyed successfully"
+  dependencies:
+    - terraform_apply
+  when: manual
+  only:
+    - branches
